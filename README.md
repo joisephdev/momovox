@@ -41,6 +41,22 @@ Precedence: `--voice/--speed` flag > `MOMOVOX_VOICE`/`MOMOVOX_SPEED` env >
 
 Audio goes to `~/.cache/momovox/` (`last.mp3` = latest; pruned to newest 20).
 
+## Omarchy bar widget 🔊
+
+This repo doubles as the Omarchy plugin (`manifest.json`, kind
+`bar-widget`, id `joisephdev.momovox`). After `./install.sh`:
+
+```bash
+rsync -av --exclude='.git' --exclude='.venv' --exclude='__pycache__' \
+  ./ ~/.config/omarchy/plugins/joisephdev.momovox/
+omarchy plugin enable joisephdev.momovox right && omarchy restart shell
+```
+
+Bar shows **Vox** (▶ while speaking): left-click opens Play clipboard /
+Stop / Replay last, right-click plays the clipboard instantly. Voice/speed
+come from the plugin settings (empty = saved `momovox --select-voice`
+default). State is polled via `momovox --status`.
+
 ## For adapter authors
 
 This binary is the whole API. Gate on `momovox --version >= 0.3.0`, share

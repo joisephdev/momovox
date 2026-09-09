@@ -1,0 +1,39 @@
+{
+  "schemaVersion": 1,
+  "id": "joisephdev.momovox",
+  "name": "Momovox",
+  "version": "0.4.0",
+  "author": "Roimer Peraza",
+  "description": "Hear text instead of reading it: bar button to narrate the clipboard, stop, or replay with a neural voice.",
+  "homepage": "https://github.com/joisephdev/momovox",
+  "license": "MIT",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Momovox",
+    "description": "Narrate the clipboard, stop playback, or replay the last narration",
+    "category": "Productivity",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "voice": "",
+      "speed": ""
+    },
+    "schema": [
+      {
+        "key": "voice",
+        "type": "string",
+        "label": "Voice shortcut (empty = saved default)",
+        "defaultValue": ""
+      },
+      {
+        "key": "speed",
+        "type": "string",
+        "label": "Speed like +15% (empty = saved default)",
+        "defaultValue": ""
+      }
+    ]
+  }
+}

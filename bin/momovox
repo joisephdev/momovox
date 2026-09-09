@@ -18,15 +18,21 @@ from __future__ import annotations
 import sys
 from pathlib import Path as _Path
 
-# Bootstrap: use the project .venv when available (edge-tts lives there),
+# Bootstrap: use the project venv when available (edge-tts lives there),
 # so `momovox` works with the system python even without pip packages.
+# New location first (~/.local/share/momovox/.venv, set by install.sh so the
+# repo dir stays clean for the Omarchy plugin), legacy in-repo .venv second.
 def _bootstrap_venv() -> None:
     try:
         here = _Path(__file__).resolve()
-        venv_py = here.parent.parent / ".venv" / "bin" / "python"
-        if venv_py.exists() and _Path(sys.prefix).resolve() != venv_py.parent.parent.resolve():
-            import os
-            os.execv(str(venv_py), [str(venv_py), str(here), *sys.argv[1:]])
+        cands = [
+            _Path.home() / ".local" / "share" / "momovox" / ".venv" / "bin" / "python",
+            here.parent.parent / ".venv" / "bin" / "python",
+        ]
+        for venv_py in cands:
+            if venv_py.exists() and _Path(sys.prefix).resolve() != venv_py.parent.parent.resolve():
+                import os
+                os.execv(str(venv_py), [str(venv_py), str(here), *sys.argv[1:]])
     except Exception:
         pass
 
@@ -228,6 +234,29 @@ def read_stdin_pipe() -> str | None:
         data = sys.stdin.read()
         return data if data.strip() else None
     return None
+
+
+def cmd_status() -> int:
+    """Print playing|idle (bar widget polls this). Checks PID file + mpv title."""
+    playing = False
+    if PID_FILE.exists():
+        try:
+            pid = int(PID_FILE.read_text().strip())
+            os.kill(pid, 0)  # exists (no signal sent)?
+            playing = True
+        except (ValueError, ProcessLookupError, PermissionError, OSError):
+            pass
+    if not playing:
+        # Replay-last uses bare mpv (no PID file); match its --title=momovox.
+        # NOTE: pattern includes 'title=momovox' so our own cmdline never matches.
+        try:
+            r = subprocess.run(["pgrep", "-f", "title=momovox"],
+                               capture_output=True, timeout=5)
+            playing = r.returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    print("playing" if playing else "idle")
+    return 0
 
 
 def stop_playback() -> int:
@@ -602,6 +631,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Only generate the mp3, do not play it.")
     p.add_argument("--stop", action="store_true",
                    help="Stop the narration in progress.")
+    p.add_argument("--status", action="store_true",
+                   help="Print playing|idle (for the bar widget).")
     p.add_argument("--select-voice", action="store_true",
                    help="Interactive picker: choose and save your default voice.")
     p.add_argument("--list-voices", action="store_true", help="Show available voices.")
@@ -650,6 +681,8 @@ def main() -> int:
 
     if args.stop:
         return stop_playback()
+    if args.status:
+        return cmd_status()
     if args.select_voice:
         return cmd_select_voice()
     if args.list_voices:

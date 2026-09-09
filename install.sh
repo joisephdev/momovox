@@ -12,8 +12,15 @@ if ! command -v uv >/dev/null 2>&1; then
 fi
 
 cd "$ROOT"
+# Venv lives OUTSIDE the repo (~/.local/share) so the folder stays lean:
+# it doubles as an Omarchy plugin dir, which gets copied as-is.
+export UV_PROJECT_ENVIRONMENT="$HOME/.local/share/momovox/.venv"
 uv sync --quiet
-echo "✅ deps (edge-tts) installed in .venv"
+echo "✅ deps (edge-tts) installed in $UV_PROJECT_ENVIRONMENT"
+if [ -d "$ROOT/.venv" ]; then
+  rm -rf "$ROOT/.venv"
+  echo "🧹 legacy in-repo .venv removed"
+fi
 
 chmod +x bin/momovox hooks/play-reply.sh
 mkdir -p "$HOME/.local/bin"
