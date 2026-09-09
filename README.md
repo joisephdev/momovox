@@ -22,6 +22,16 @@ momovox "hello, I can read your long texts aloud"
 
 Requires: `uv`, `mpv`, `ffmpeg`, `wl-clipboard` (Wayland), internet.
 
+## Uninstall
+
+```bash
+omarchy plugin disable joisephdev.momovox   # if enabled as widget
+omarchy plugin remove joisephdev.momovox    # removes ~/.config/omarchy/plugins/joisephdev.momovox
+rm -f ~/.local/bin/momovox ~/.local/bin/momovox-play-reply
+rm -rf ~/.local/share/momovox/.venv        # deps (edge-tts)
+rm -rf ~/.cache/momovox ~/.config/momovox  # audio cache + voice prefs (optional)
+```
+
 ## Usage
 
 ```bash
