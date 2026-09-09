@@ -33,7 +33,7 @@ Panel {
   property bool busy: false
   property string lastError: ""
 
-  readonly property string stateText: root.speaking ? "Speaking…" : "Idle"
+  readonly property string stateText: root.speaking ? "Speaking" : "Idle"
   readonly property string voiceText: root.voice !== "" ? root.voice : "default"
 
   visible: true
@@ -218,7 +218,7 @@ Panel {
 
         Button {
           width: parent.width
-          text: "⏹  Stop"
+          text: "■  Stop"
           foreground: root.foreground
           fontFamily: root.fontFamily
           fontSize: Style.font.bodySmall
