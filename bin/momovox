@@ -57,7 +57,7 @@ LAST_LINK = CACHE_DIR / "last.mp3"
 CONFIG_DIR = Path.home() / ".config" / "momovox"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 DEFAULT_VOICE = "es-MX-DaliaNeural"
-__VERSION__ = "0.3.0"
+__VERSION__ = "0.4.0"
 MAX_CHUNK = 2800  # Edge-TTS stays stable below ~3000 chars per request
 PLAY_CHUNK = 350  # streaming pipeline: ~5-8s to first audio, ~35s of voice per chunk
 CACHE_KEEP = 20  # retention: newest N audios kept (override: MOMOVOX_KEEP)
@@ -482,7 +482,7 @@ def concat_mp3(parts: list[Path], dest: Path) -> Path:
         shutil.copy(parts[0], dest)
         return dest
     if not shutil.which("ffmpeg"):
-        raise SystemExit("Missing ffmpeg to join chunks. Install it: sudo pacman -S ffmpeg")
+        raise SystemExit("Missing ffmpeg to join chunks. Install ffmpeg with your distro's package manager and retry.")
     lst = parts[0].parent / "filelist.txt"
     lst.write_text("".join(f"file '{p.name}'\n" for p in parts), encoding="utf-8")
     r = subprocess.run(
@@ -499,7 +499,7 @@ def concat_mp3(parts: list[Path], dest: Path) -> Path:
 def play_mp3(path: Path) -> int:
     """Play one file with mpv. Writes PID_FILE; the caller removes it."""
     if not shutil.which("mpv"):
-        raise SystemExit("Missing mpv for playback. Install it: sudo pacman -S mpv")
+        raise SystemExit("Missing mpv for playback. Install mpv with your distro's package manager and retry.")
     cmd = ["mpv", "--no-video", "--title=momovox"]
     ao = os.environ.get("MOMOVOX_AO", "").strip()  # test knob: MOMOVOX_AO=null = silent
     if ao:
@@ -719,8 +719,8 @@ def main() -> int:
     except ImportError:
         raise SystemExit(
             "❌ Missing speech engine. Install it with:\n"
-            "   uv pip install --system edge-tts   # or inside the project venv\n"
-            "   (+ mpv and ffmpeg: sudo pacman -S mpv ffmpeg)"
+            "   Run ./install.sh (it creates the isolated venv with edge-tts) and retry.\n"
+            "   (mpv and ffmpeg must be present: see README requirements.)"
         )
 
     CACHE_DIR.mkdir(parents=True, exist_ok=True)

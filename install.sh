@@ -30,7 +30,7 @@ ln -sf "$ROOT/hooks/play-reply.sh" "$HOME/.local/bin/momovox-play-reply"
 echo "✅ symlink: ~/.local/bin/momovox-play-reply (notification click handler)"
 
 for dep in mpv ffmpeg wl-paste; do
-  command -v "$dep" >/dev/null 2>&1 && echo "✅ $dep ok" || echo "⚠️  missing $dep (sudo pacman -S ${dep/wl-paste/wl-clipboard})"
+  command -v "$dep" >/dev/null 2>&1 && echo "✅ $dep ok" || echo "⚠️  missing $dep — install it with your distro's package manager (note: wl-paste is provided by wl-clipboard)"
 done
 
 # Agent harness adapters (pi skill/extension, …) live in momovox-pi

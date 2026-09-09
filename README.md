@@ -75,5 +75,12 @@ See the contract in [../SPLIT_PLAN.md](../SPLIT_PLAN.md).
 
 ## Security (for marketplace review)
 
-Outbound HTTPS only (Microsoft Edge TTS endpoint), no API keys, no inbound
-ports, no credentials. Disk state: disposable mp3 cache + voice/speed prefs.
+- Network: outbound HTTPS only, to the Microsoft Edge text-to-speech
+  endpoint. No API keys, no inbound ports, no credentials, no telemetry.
+- Privacy: only the text you explicitly choose to narrate (clipboard,
+  file, or typed input) is sent for synthesis. Nothing else leaves the
+  machine. Do not narrate secrets.
+- Disk: disposable mp3 cache (`~/.cache/momovox`, newest 20 kept) +
+  voice/speed prefs (`~/.config/momovox/config.json`).
+- Install: no sudo, no services, no config overwrites (symlinks in
+  `~/.local/bin` + isolated venv only).

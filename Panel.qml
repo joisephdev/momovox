@@ -253,7 +253,7 @@ Panel {
 
         Text {
           width: parent.width
-          text: "Change the default voice any time: momovox --select-voice"
+          text: "Synthesized online (Edge TTS) · voices: momovox --select-voice"
           textFormat: Text.PlainText
           wrapMode: Text.Wrap
           color: root.dim

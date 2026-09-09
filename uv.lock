@@ -342,7 +342,7 @@ dependencies = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "edge-tts", specifier = ">=7.0.0" }]
+requires-dist = [{ name = "edge-tts", specifier = "==7.2.8" }]
 
 [[package]]
 name = "multidict"
