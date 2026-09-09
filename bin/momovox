@@ -1,0 +1,750 @@
+#!/usr/bin/env python3
+"""momovox — read long texts aloud with a neural voice (Edge-TTS).
+
+Usage:
+    momovox "long text..."
+    echo "text..." | momovox
+    momovox answer.md
+    momovox --clipboard
+    momovox --paste
+    momovox --stop
+    momovox --list-voices
+
+Default voice: es-MX-DaliaNeural (neutral Mexican Spanish).
+Requires: edge-tts (pip), mpv, ffmpeg. Clipboard on Wayland: wl-paste.
+"""
+from __future__ import annotations
+
+import sys
+from pathlib import Path as _Path
+
+# Bootstrap: use the project .venv when available (edge-tts lives there),
+# so `momovox` works with the system python even without pip packages.
+def _bootstrap_venv() -> None:
+    try:
+        here = _Path(__file__).resolve()
+        venv_py = here.parent.parent / ".venv" / "bin" / "python"
+        if venv_py.exists() and _Path(sys.prefix).resolve() != venv_py.parent.parent.resolve():
+            import os
+            os.execv(str(venv_py), [str(venv_py), str(here), *sys.argv[1:]])
+    except Exception:
+        pass
+
+
+_bootstrap_venv()
+
+import argparse
+import asyncio
+import os
+import re
+import shutil
+import signal
+import subprocess
+import tempfile
+import threading
+from datetime import datetime
+from pathlib import Path
+
+CACHE_DIR = Path.home() / ".cache" / "momovox"
+PID_FILE = Path("/tmp/momovox.pid")
+LAST_LINK = CACHE_DIR / "last.mp3"
+CONFIG_DIR = Path.home() / ".config" / "momovox"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+DEFAULT_VOICE = "es-MX-DaliaNeural"
+__VERSION__ = "0.3.0"
+MAX_CHUNK = 2800  # Edge-TTS stays stable below ~3000 chars per request
+PLAY_CHUNK = 350  # streaming pipeline: ~5-8s to first audio, ~35s of voice per chunk
+CACHE_KEEP = 20  # retention: newest N audios kept (override: MOMOVOX_KEEP)
+LOG_MAX_BYTES = 100_000  # hook-play.log rotated to this size
+
+# Voice shortcuts: short name -> full Edge voice id (curated catalog).
+# Spanish (default) and English; any other Edge id (xx-XX-NameNeural) also works.
+VOICES = {
+    # --- Spanish ---
+    "dalia": "es-MX-DaliaNeural",
+    "jorge": "es-MX-JorgeNeural",
+    "beatriz": "es-MX-BeatrizNeural",
+    "carlota": "es-MX-CarlotaNeural",
+    "paola": "es-VE-PaolaNeural",
+    "sebastian": "es-VE-SebastianNeural",
+    "elvira": "es-ES-ElviraNeural",
+    "alvaro": "es-ES-AlvaroNeural",
+    "lorenzo": "es-CL-LorenzoNeural",
+    # --- English (US) ---
+    "ava": "en-US-AvaNeural",
+    "andrew": "en-US-AndrewNeural",
+    "emma": "en-US-EmmaNeural",
+    "brian": "en-US-BrianNeural",
+    # --- English (UK) ---
+    "sonia": "en-GB-SoniaNeural",
+    "ryan": "en-GB-RyanNeural",
+}
+
+VOICE_GROUPS = (
+    ("Spanish (MX)", ("dalia", "jorge", "beatriz", "carlota")),
+    ("Spanish (VE)", ("paola", "sebastian")),
+    ("Spanish (ES)", ("elvira", "alvaro")),
+    ("Spanish (CL)", ("lorenzo",)),
+    ("English (US)", ("ava", "andrew", "emma", "brian")),
+    ("English (UK)", ("sonia", "ryan")),
+)
+
+# ---------------------------------------------------------------- cleaning ---
+
+def clean_markdown(text: str) -> str:
+    """Turn markdown / agent answers into plain narratable text."""
+    t = text
+    # Fenced code blocks ```...``` -> keep content, drop fences
+    t = re.sub(r"```[\w+-]*\n(.*?)```", r"\1", t, flags=re.DOTALL)
+    # Inline code `x` -> x
+    t = re.sub(r"`([^`]+)`", r"\1", t)
+    # Images ![alt](url) -> alt
+    t = re.sub(r"!\[([^\]]*)\]\([^)]+\)", r"\1", t)
+    # Links [text](url) -> text
+    t = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", t)
+    # Bare URLs -> "link"
+    t = re.sub(r"https?://\S+", "link", t)
+    # Headings ### -> text
+    t = re.sub(r"^#{1,6}\s*", "", t, flags=re.MULTILINE)
+    # Bold/italic/strike: **x**, __x__, *x*, _x_, ~~x~~ -> x
+    t = re.sub(r"\*\*(.+?)\*\*", r"\1", t)
+    t = re.sub(r"__(.+?)__", r"\1", t)
+    t = re.sub(r"~~(.+?)~~", r"\1", t)
+    t = re.sub(r"(?<!\w)\*([^*\n]+)\*(?!\w)", r"\1", t)
+    t = re.sub(r"(?<!\w)_([^_\n]+)_(?!\w)", r"\1", t)
+    # Blockquotes >
+    t = re.sub(r"^>\s?", "", t, flags=re.MULTILINE)
+    # Horizontal rules
+    t = re.sub(r"^[-*_]{3,}\s*$", "", t, flags=re.MULTILINE)
+    # List markers: "- ", "* ", "1. " at line start
+    t = re.sub(r"^\s*[-*+]\s+", "", t, flags=re.MULTILINE)
+    t = re.sub(r"^\s*\d+[.)]\s+", "", t, flags=re.MULTILINE)
+    # Tables: | -> comma
+    t = re.sub(r"\|", ", ", t)
+    # HTML tags
+    t = re.sub(r"<[^>]+>", "", t)
+    # Common emoji ranges
+    t = re.sub(
+        "[\U0001F000-\U0001FAFF\u2600-\u27BF\u2B00-\u2BFF\uFE0F]",
+        "",
+        t,
+    )
+    # Agent separators: ---, === -> pause
+    t = re.sub(r"^[=\-~]{4,}\s*$", ". ", t, flags=re.MULTILINE)
+    # Collapse whitespace and stacked blank lines
+    t = re.sub(r"[ \t]+", " ", t)
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    # Ensure terminal punctuation per line for good prosody
+    lines = []
+    for line in t.split("\n"):
+        s = line.strip()
+        if s and s[-1] not in ".!?,;:…":
+            s += "."
+        lines.append(s)
+    t = "\n".join(lines)
+    t = re.sub(r"\n{3,}", "\n\n", t).strip()
+    return t
+
+
+def split_chunks(text: str, max_len: int = MAX_CHUNK) -> list[str]:
+    """Split into sentence-aligned blocks of at most max_len chars."""
+    paras = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
+    chunks: list[str] = []
+    buf = ""
+    # Sentences: split on . ! ? followed by uppercase/digit
+    sent_re = re.compile(r"(?<=[.!?¿¡…])\s+(?=[A-ZÁÉÍÓÚÑ¿¡\d])")
+    for para in paras:
+        for sent in sent_re.split(para):
+            sent = sent.strip()
+            if not sent:
+                continue
+            if len(buf) + len(sent) + 1 <= max_len:
+                buf = f"{buf} {sent}".strip()
+            else:
+                if buf:
+                    chunks.append(buf)
+                # Oversized sentence: split on words
+                while len(sent) > max_len:
+                    cut = sent.rfind(" ", 0, max_len)
+                    cut = cut if cut > 0 else max_len
+                    chunks.append(sent[:cut].strip())
+                    sent = sent[cut:].strip()
+                buf = sent
+    if buf:
+        chunks.append(buf)
+    return [c for c in chunks if c]
+
+
+def normalize_rate(raw: str) -> str:
+    """Accept +20%, -10%, 20, 1.2x, 0.8x -> Edge format (+20%/-20%)."""
+    s = raw.strip().replace(" ", "")
+    m = re.match(r"^([+-]?)(\d+(?:\.\d+)?)(%|x)?$", s, re.IGNORECASE)
+    if not m:
+        raise ValueError(f"invalid speed: {raw!r} (examples: +20%, -10%, 1.2x)")
+    sign, num, unit = m.groups()
+    val = float(num)
+    if unit and unit.lower() == "x":
+        pct = round((val - 1.0) * 100)
+    else:
+        pct = round(val)
+        if sign == "-":
+            pct = -pct
+        elif sign == "" and s.startswith("-"):
+            pct = -pct
+    pct = max(-90, min(90, pct))
+    return f"{pct:+d}%"
+
+
+def resolve_voice(raw: str) -> str:
+    key = raw.strip().lower()
+    if key in VOICES:
+        return VOICES[key]
+    # Accept a full Edge voice id (es-XX-NameNeural) as-is
+    if re.match(r"^[a-z]{2}-[A-Z]{2}-\w+Neural$", raw.strip()):
+        return raw.strip()
+    raise ValueError(
+        f"unknown voice: {raw!r}. Use --list-voices or a shortcut: {', '.join(sorted(VOICES))}"
+    )
+
+
+# ----------------------------------------------------------------- sources ---
+
+def read_clipboard() -> str:
+    for cmd in (["wl-paste"], ["xclip", "-o"], ["xsel", "-b"]):
+        if shutil.which(cmd[0]):
+            try:
+                out = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+                if out.returncode == 0 and out.stdout.strip():
+                    return out.stdout
+            except (subprocess.TimeoutExpired, OSError):
+                continue
+    raise SystemExit(
+        "Could not read the clipboard (missing wl-paste/xclip/xsel, or it is empty)."
+    )
+
+
+def read_stdin_pipe() -> str | None:
+    if not sys.stdin.isatty():
+        data = sys.stdin.read()
+        return data if data.strip() else None
+    return None
+
+
+def stop_playback() -> int:
+    killed = False
+    if PID_FILE.exists():
+        try:
+            pid = int(PID_FILE.read_text().strip())
+            os.kill(pid, signal.SIGTERM)
+            killed = True
+        except (ValueError, ProcessLookupError, PermissionError, OSError):
+            pass
+        try:
+            PID_FILE.unlink()
+        except OSError:
+            pass
+    # Safety net: kill only mpv instances launched by momovox (--title=momovox).
+    # NOTE: the pattern must include 'title=momovox' so it never matches our
+    # own shell (whose cmdline contains 'momovox' via cwd/command).
+    try:
+        r = subprocess.run(
+            ["pkill", "-f", "title=momovox"],
+            capture_output=True,
+            timeout=5,
+        )
+        if r.returncode == 0:
+            killed = True
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    # Also stop background synthesis workers: pipelined playback runs `momovox`
+    # detached (notification clicks), and killing mpv alone would let the worker
+    # spawn a new player for the next chunk. Never match ourselves (our own
+    # cmdline contains this path after the venv bootstrap exec).
+    try:
+        me = str(os.getpid())
+        r = subprocess.run(
+            ["pgrep", "-f", "momovox/bin/momovox"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if r.returncode == 0:
+            for pid in r.stdout.split():
+                pid = pid.strip()
+                if pid and pid != me and pid.isdigit():
+                    try:
+                        os.kill(int(pid), signal.SIGTERM)
+                        killed = True
+                    except (ProcessLookupError, PermissionError, OSError):
+                        pass
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    print("⏹ Playback stopped." if killed else "ℹ No narration in progress.")
+    return 0
+
+
+# --------------------------------------------------------------- config ---
+
+def load_config() -> dict:
+    """Persistent defaults (~/.config/momovox/config.json)."""
+    try:
+        if CONFIG_FILE.is_file():
+            import json
+            data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        pass
+    return {}
+
+
+def save_config(data: dict) -> Path:
+    import json
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    cur = load_config()
+    cur.update(data)
+    CONFIG_FILE.write_text(json.dumps(cur, indent=2) + "\n", encoding="utf-8")
+    return CONFIG_FILE
+
+
+def resolve_setting(cli_value: str | None, env_name: str, config_key: str,
+                    default: str) -> str:
+    """Precedence: CLI flag > env var > config file > default."""
+    if cli_value:
+        return cli_value
+    env_val = os.environ.get(env_name, "").strip()
+    if env_val:
+        return env_val
+    cfg_val = load_config().get(config_key)
+    if isinstance(cfg_val, str) and cfg_val.strip():
+        return cfg_val.strip()
+    return default
+
+
+def cmd_select_voice() -> int:
+    """Interactive picker: list catalog, choose number, save default + preview."""
+    flat: list[tuple[str, str, str]] = []
+    for group, names in VOICE_GROUPS:
+        for k in names:
+            flat.append((group, k, VOICES[k]))
+    current = resolve_setting(None, "MOMOVOX_VOICE", "voice", DEFAULT_VOICE)
+    print("Choose your default voice "
+          f"(saved to {CONFIG_FILE}):\n")
+    last_group = ""
+    for i, (group, short, vid) in enumerate(flat, 1):
+        if group != last_group:
+            print(f"  {group}:")
+            last_group = group
+        cur = " ← current" if vid == current or short == current else ""
+        print(f"    {i:2d}) {short:10s} {vid}{cur}")
+    try:
+        ans = input(f"\nNumber [1-{len(flat)}]: ").strip()
+    except EOFError:
+        print("\nCancelled.")
+        return 1
+    if not ans.isdigit() or not 1 <= int(ans) <= len(flat):
+        print(f"❌ Pick a number between 1 and {len(flat)}.")
+        return 1
+    _, short, vid = flat[int(ans) - 1]
+    cur_speed = resolve_setting(None, "MOMOVOX_SPEED", "speed", "+0%")
+    try:
+        spd = input(f"Speed [{cur_speed}] (+20%, -10%, 1.2x, Enter keeps): ").strip()
+    except EOFError:
+        spd = ""
+    try:
+        speed = normalize_rate(spd) if spd else cur_speed
+    except ValueError as e:
+        print(f"⚠️ {e} — keeping {cur_speed}.")
+        speed = cur_speed
+    save_config({"voice": short, "speed": speed})
+    print(f"✅ Default voice: {short} ({vid}) | speed {speed}")
+    # Preview so you hear the choice right away
+    sample = (f"Hi, I'm {short}, this is how I sound." if vid.startswith("en-")
+              else f"Hola, soy {short} y así me escucho.")
+    print("▶ Preview…")
+    try:
+        import edge_tts  # noqa: F401
+        with tempfile.TemporaryDirectory(prefix="momovox-preview-") as td:
+            out = Path(td) / "preview.mp3"
+            asyncio.run(_gen_chunk(sample, vid, speed, out))
+            play_mp3(out)
+    except SystemExit as e:
+        print(f"⚠️ Preview skipped ({e}). Choice is saved anyway.")
+    except Exception as e:
+        print(f"⚠️ Preview failed ({e}). Choice is saved anyway.")
+    finally:
+        try:
+            if PID_FILE.exists():
+                PID_FILE.unlink()
+        except OSError:
+            pass
+    return 0
+
+
+# --------------------------------------------------------------- retention ---
+
+def _cache_keep() -> int:
+    try:
+        return max(1, int(os.environ.get("MOMOVOX_KEEP", str(CACHE_KEEP))))
+    except ValueError:
+        return CACHE_KEEP
+
+
+def prune_cache() -> None:
+    """Keep only the newest audios; fix last.mp3; rotate the hook log."""
+    try:
+        files = sorted(
+            (p for p in CACHE_DIR.glob("momovox-*.mp3") if p.is_file()),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        for old in files[_cache_keep():]:
+            try:
+                old.unlink()
+            except OSError:
+                pass
+        # last.mp3 must never dangle
+        try:
+            if LAST_LINK.is_symlink() and not LAST_LINK.exists():
+                newest = files[:1]
+                if newest and newest[0].exists():
+                    LAST_LINK.unlink()
+                    LAST_LINK.symlink_to(newest[0])
+                else:
+                    LAST_LINK.unlink()
+        except OSError:
+            pass
+        # hook-play.log: keep only the tail
+        log = CACHE_DIR / "hook-play.log"
+        try:
+            if log.is_file() and log.stat().st_size > LOG_MAX_BYTES:
+                with open(log, "rb") as f:
+                    f.seek(-LOG_MAX_BYTES, os.SEEK_END)
+                    tail = f.read().split(b"\n", 1)[-1]
+                with open(log, "wb") as f:
+                    f.write(tail)
+        except OSError:
+            pass
+    except OSError:
+        pass
+
+
+# --------------------------------------------------------------------- tts ---
+
+async def _gen_chunk(text: str, voice: str, rate: str, out: Path) -> None:
+    import edge_tts  # deferred import so --help/--stop work without deps
+
+    comm = edge_tts.Communicate(text, voice, rate=rate)
+    await comm.save(str(out))
+
+
+async def _gen_all(chunks: list[str], voice: str, rate: str, tmpdir: Path) -> list[Path]:
+    # Sequential: Edge rate-limits parallel requests (HTTP 429)
+    outs: list[Path] = []
+    for i, ch in enumerate(chunks):
+        out = tmpdir / f"chunk{i:03d}.mp3"
+        await _gen_chunk(ch, voice, rate, out)
+        outs.append(out)
+        print(f"  🔊 chunk {i + 1}/{len(chunks)} ({len(ch)} chars)…", file=sys.stderr)
+    return outs
+
+
+def concat_mp3(parts: list[Path], dest: Path) -> Path:
+    if len(parts) == 1:
+        shutil.copy(parts[0], dest)
+        return dest
+    if not shutil.which("ffmpeg"):
+        raise SystemExit("Missing ffmpeg to join chunks. Install it: sudo pacman -S ffmpeg")
+    lst = parts[0].parent / "filelist.txt"
+    lst.write_text("".join(f"file '{p.name}'\n" for p in parts), encoding="utf-8")
+    r = subprocess.run(
+        ["ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0",
+         "-i", str(lst), "-c", "copy", str(dest)],
+        capture_output=True,
+        text=True,
+    )
+    if r.returncode != 0 or not dest.exists():
+        raise SystemExit(f"ffmpeg failed while joining chunks:\n{r.stderr[-2000:]}")
+    return dest
+
+
+def play_mp3(path: Path) -> int:
+    """Play one file with mpv. Writes PID_FILE; the caller removes it."""
+    if not shutil.which("mpv"):
+        raise SystemExit("Missing mpv for playback. Install it: sudo pacman -S mpv")
+    cmd = ["mpv", "--no-video", "--title=momovox"]
+    ao = os.environ.get("MOMOVOX_AO", "").strip()  # test knob: MOMOVOX_AO=null = silent
+    if ao:
+        cmd.append(f"--ao={ao}")
+    cmd.append(str(path))
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        PID_FILE.write_text(str(proc.pid))
+    except OSError:
+        pass
+    try:
+        return proc.wait()
+    except KeyboardInterrupt:
+        proc.terminate()
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        print("\n⏹ Playback interrupted (Ctrl+C).")
+        return 130
+
+
+def play_pipeline(
+    chunks: list[str], voice: str, rate: str, tmpdir: Path
+) -> tuple[list[Path], bool, bool]:
+    """Streaming playback: synthesize ahead while playing.
+
+    A background thread synthesizes chunk files while the main thread plays
+    them in order with mpv. Chunk boundaries fall on sentence ends, so the
+    small gaps between players sound like natural pauses. First audio starts
+    after one small chunk (~5-8s) instead of the whole text (~1s/45 chars).
+
+    Returns (completed files, stopped_early, interrupted_by_ctrl_c).
+    """
+    n = len(chunks)
+    ready = [threading.Event() for _ in range(n)]
+    stop = threading.Event()
+    state: dict[str, Exception | None] = {"error": None}
+
+    def produce() -> None:
+        try:
+            for i, ch in enumerate(chunks):
+                if stop.is_set():
+                    break
+                out = tmpdir / f"chunk{i:03d}.mp3"
+                asyncio.run(_gen_chunk(ch, voice, rate, out))
+                print(f"  🔊 chunk {i + 1}/{n} ready ({len(ch)} chars)…", file=sys.stderr)
+                ready[i].set()
+        except Exception as e:  # noqa: BLE001 - surfaced to the player below
+            state["error"] = e
+        finally:
+            for ev in ready:
+                ev.set()
+
+    def stopped_externally(played_any: bool) -> bool:
+        # `momovox --stop` kills mpv AND removes PID_FILE; our own player
+        # keeps PID_FILE alive across chunks, so a missing file means stop.
+        return played_any and not PID_FILE.exists()
+
+    worker = threading.Thread(target=produce, name="momovox-synth", daemon=True)
+    worker.start()
+    done: list[Path] = []
+    played_any = False
+    interrupted = False
+    try:
+        for i in range(n):
+            while not ready[i].wait(timeout=0.2):
+                if stop.is_set() or stopped_externally(played_any):
+                    break
+            if stop.is_set():
+                break
+            if stopped_externally(played_any):
+                print("⏹ Stopped by `momovox --stop`.", file=sys.stderr)
+                break
+            out = tmpdir / f"chunk{i:03d}.mp3"
+            if not out.exists():
+                break  # producer failed; reported below
+            print(f"▶ Playing {i + 1}/{n}… (Ctrl+C or `momovox --stop` to stop)",
+                  file=sys.stderr)
+            rc = play_mp3(out)  # blocks; Ctrl+C handled inside -> 130
+            played_any = True
+            done.append(out)
+            if rc == 130:
+                interrupted = True
+                break
+    finally:
+        stop.set()
+        try:
+            if PID_FILE.exists():
+                PID_FILE.unlink()
+        except OSError:
+            pass
+    worker.join(timeout=15)
+    err = state["error"]
+    if err is not None and not done:
+        raise err
+    stopped_early = len(done) < n
+    if err is not None and stopped_early:
+        print(f"⚠️ Synthesis failed partway, played {len(done)}/{n}: {err}",
+              file=sys.stderr)
+    return done, stopped_early, interrupted
+
+
+# --------------------------------------------------------------------- cli ---
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="momovox",
+        description="Read long texts aloud with a neural voice (Edge-TTS, MX voice by default).",
+    )
+    p.add_argument("text", nargs="*", help="Text to momovox or path to a file (.md/.txt).")
+    p.add_argument("-f", "--file", help="File to read.")
+    p.add_argument("-c", "--clipboard", action="store_true",
+                   help="Narrate the clipboard (your Ctrl+C of the agent answer).")
+    p.add_argument("--paste", action="store_true",
+                   help="Paste text manually (finish with Ctrl+D).")
+    p.add_argument("-v", "--voice", default=None,
+                   help="Voice shortcut (see --list-voices) or full Edge id. "
+                        "Overrides MOMOVOX_VOICE and the saved default.")
+    p.add_argument("--speed", "--rate", default=None,
+                   help="Speed: +20%%, -10%%, 1.2x. Overrides MOMOVOX_SPEED "
+                        "and the saved default.")
+    p.add_argument("-o", "--save", help="Save the mp3 to this path in addition to playing it.")
+    p.add_argument("--no-play", action="store_true",
+                   help="Only generate the mp3, do not play it.")
+    p.add_argument("--stop", action="store_true",
+                   help="Stop the narration in progress.")
+    p.add_argument("--select-voice", action="store_true",
+                   help="Interactive picker: choose and save your default voice.")
+    p.add_argument("--list-voices", action="store_true", help="Show available voices.")
+    p.add_argument("--version", action="version", version=f"%(prog)s {__VERSION__}")
+    p.add_argument("--verbose", action="store_true")
+    return p
+
+
+def get_input_text(args: argparse.Namespace, parser: argparse.ArgumentParser) -> str:
+    if args.clipboard:
+        t = read_clipboard()
+        if not t.strip():
+            raise SystemExit("The clipboard is empty.")
+        return t
+    if args.paste:
+        print("📋 Paste the text and press Ctrl+D to momovox:", file=sys.stderr)
+        t = sys.stdin.read()
+        if not t.strip():
+            raise SystemExit("Nothing was pasted.")
+        return t
+    if args.file:
+        fp = Path(args.file).expanduser()
+        if not fp.exists():
+            raise SystemExit(f"File not found: {fp}")
+        return fp.read_text(encoding="utf-8", errors="replace")
+    piped = read_stdin_pipe()
+    if piped:
+        return piped
+    if args.text:
+        joined = " ".join(args.text).strip()
+        # A single argument pointing to an existing file -> read it
+        if len(args.text) == 1 and Path(joined).expanduser().exists() \
+                and Path(joined).expanduser().is_file():
+            return Path(joined).expanduser().read_text(encoding="utf-8", errors="replace")
+        if joined:
+            return joined
+    parser.print_help(sys.stderr)
+    raise SystemExit(
+        "\n❌ No text given. Examples: momovox \"hello world\" | momovox --clipboard | momovox --paste"
+    )
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+
+    if args.stop:
+        return stop_playback()
+    if args.select_voice:
+        return cmd_select_voice()
+    if args.list_voices:
+        print("Voice catalog (shortcut -> Edge id):")
+        for group, names in VOICE_GROUPS:
+            print(f"\n  {group}:")
+            for k in names:
+                mark = " ← default" if VOICES[k] == DEFAULT_VOICE else ""
+                print(f"    {k:10s} {VOICES[k]}{mark}")
+        print("\nAny other Edge voice also works: "
+              "-v en-AU-NatashaNeural  (see `edge-tts --list-voices`)")
+        return 0
+
+    try:
+        voice = resolve_voice(
+            resolve_setting(args.voice, "MOMOVOX_VOICE", "voice", DEFAULT_VOICE))
+        rate = normalize_rate(
+            resolve_setting(args.speed, "MOMOVOX_SPEED", "speed", "+0%"))
+    except ValueError as e:
+        raise SystemExit(f"❌ {e}")
+
+    raw = get_input_text(args, parser)
+    text = clean_markdown(raw)
+    if not text.strip():
+        raise SystemExit("❌ The text is empty after cleaning the formatting.")
+    # Small chunks for streaming playback (first audio in seconds),
+    # big chunks for one-shot file generation (fewer requests).
+    chunks = split_chunks(text, PLAY_CHUNK if not args.no_play else MAX_CHUNK)
+    if not chunks:
+        raise SystemExit("❌ Nothing to momovox.")
+
+    try:
+        import edge_tts  # noqa: F401
+    except ImportError:
+        raise SystemExit(
+            "❌ Missing speech engine. Install it with:\n"
+            "   uv pip install --system edge-tts   # or inside the project venv\n"
+            "   (+ mpv and ffmpeg: sudo pacman -S mpv ffmpeg)"
+        )
+
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    prune_cache()  # retention first: never let the cache grow unbounded
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    final = CACHE_DIR / f"momovox-{stamp}.mp3"
+    mode = "streaming" if not args.no_play else "one-shot"
+    print(f"🎙 Voice: {voice} | speed: {rate} | {len(text)} chars "
+          f"in {len(chunks)} chunk(s) [{mode}]",
+          file=sys.stderr)
+    stopped_early = False
+    interrupted = False
+    try:
+        with tempfile.TemporaryDirectory(prefix="momovox-") as td:
+            tmpdir = Path(td)
+            if args.no_play:
+                parts = asyncio.run(_gen_all(chunks, voice, rate, tmpdir))
+            else:
+                print("▶ Streaming… first audio in seconds "
+                      "(Ctrl+C or `momovox --stop` to stop)", file=sys.stderr)
+                parts, stopped_early, interrupted = play_pipeline(
+                    chunks, voice, rate, tmpdir)
+                if not parts:
+                    if interrupted or stopped_early:
+                        print("⏹ Stopped before any audio was ready.")
+                        return 130
+                    raise SystemExit("❌ No audio was produced.")
+            concat_mp3(parts, final)
+    except SystemExit:
+        raise
+    except Exception as e:
+        raise SystemExit(
+            f"❌ Synthesis failed (offline? Edge-TTS needs internet):\n{e}\n"
+            "Retry in a few seconds. Offline fallback (Piper) is planned for phase 2."
+        )
+
+    try:
+        LAST_LINK.unlink(missing_ok=True)
+        LAST_LINK.symlink_to(final)
+    except OSError:
+        pass
+    if args.save:
+        dest = Path(args.save).expanduser()
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(final, dest)
+        print(f"💾 Saved: {dest}", file=sys.stderr)
+
+    if args.verbose:
+        print(f"📄 Clean text: {len(text)} chars", file=sys.stderr)
+        print(f"🎧 Audio: {final}", file=sys.stderr)
+    if args.no_play:
+        print(f"✅ Audio ready (not played): {final}")
+        return 0
+    tag = " (partial)" if stopped_early else ""
+    print(f"✅ Done{tag}: {final}")
+    return 130 if interrupted else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

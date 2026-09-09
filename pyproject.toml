@@ -1,0 +1,15 @@
+[project]
+name = "momovox"
+version = "0.3.0"
+description = "Read long agent answers aloud with a neural voice (Edge-TTS). CLI momovox + /momovox skill."
+readme = "README.md"
+requires-python = ">=3.10"
+
+dependencies = [
+  "edge-tts>=7.0.0",
+]
+
+# (no console scripts: bin/momovox is installed via symlink by install.sh)
+
+[tool.uv]
+package = false
